@@ -1,0 +1,91 @@
+# Debugging API Requests Returning HTML After Frontend Deployment
+
+## Symptom
+
+After deploying a Vue 3 sub-application to a K8s environment, all API requests returned 200 status codes, but the response body was the frontend HTML page instead of JSON data. Everything worked fine in the local development environment.
+
+## Project Background
+
+A legacy frontend and a new sub-application are bundled into the same Docker image, served by nginx as static files. The backend is deployed independently.
+
+## Root Cause Analysis
+
+**Why it works locally:** The Vite dev server has a proxy configuration that forwards API requests to the backend.
+
+**Why it fails in production:** There's no Vite in production — nginx only serves static files and doesn't proxy API requests. The legacy frontend uses a runtime environment variable injection mechanism that lets the browser request the backend directly via an absolute URL. The new sub-application was missing this mechanism, so API requests were sent as relative paths and caught by nginx's `try_files` fallback, which returned `index.html`.
+
+## Runtime Environment Variable Injection
+
+The project uses a "build once, deploy everywhere" strategy:
+
+```
+Build time: .env.production contains placeholder values → Vite embeds them into JS
+              ↓
+Container startup: shell script reads placeholders → fetches real values from K8s env vars → sed replaces placeholders in JS
+              ↓
+Runtime: browser JS now contains real backend URLs → requests go directly to backend, bypassing frontend nginx
+```
+
+Core script logic:
+
+```sh
+# Read each line from the .env file
+cat .env | while read line; do
+  key=${line%=*}            # extract key
+  placeholder=${line#*=}    # extract placeholder value
+  env_name=${key#*VITE_}    # strip VITE_ prefix
+
+  # Read real value from K8s environment variable
+  real_value=$(eval echo '$'$env_name)
+
+  # Replace placeholder with real value in bundled JS files
+  sed -i "s?$placeholder?$real_value?g" $(grep $placeholder -rl assets/)
+done
+```
+
+## The Fix (3 Changes)
+
+### 1. Add `.env.production`
+
+Create an environment variable file for the new sub-application with the same placeholder as the legacy frontend:
+
+```
+VITE_API=__PLACEHOLDER__
+```
+
+The placeholder must match the legacy frontend's — otherwise the injection script can't find it.
+
+### 2. Extend the injection script's scan scope
+
+The original script only scanned the legacy frontend's asset directory. It needs to also scan the new sub-application's assets:
+
+```sh
+# Before
+sed -i "s?$placeholder?$real_value?g" $(grep $placeholder -rl assets)
+
+# After
+sed -i "s?$placeholder?$real_value?g" $(grep $placeholder -rl assets sub-app/assets)
+```
+
+### 3. Fix API base URL concatenation
+
+The environment variable value is a bare domain (e.g., `https://api.example.com`) without the API path prefix. It needs to be explicitly concatenated in code:
+
+```js
+// Before: path prefix lost when env var has a value
+baseURL: import.meta.env.VITE_API || '/api'
+
+// After: always concatenate the path prefix
+baseURL: (import.meta.env.VITE_API || '') + '/api'
+```
+
+## Lessons Learned
+
+1. **Placeholders must match**: New and legacy frontends must use the same placeholder string, or the injection script won't find and replace it
+2. **Watch the scan scope**: The injection script only scans directories it's told to — newly added sub-application asset directories must be explicitly included
+3. **Local vs. production proxy mechanisms are completely different**: Local uses Vite proxy; production uses env var injection + browser-direct-to-backend. Don't assume one implies the other
+4. **baseURL concatenation**: Environment variables typically provide only the domain. API path prefixes must be explicitly appended in code
+
+## When This Applies
+
+If you're deploying multiple frontend applications in a single Docker image and need multi-environment support, runtime environment variable injection is a common pattern. The key is ensuring every sub-application is properly wired into the injection pipeline.
